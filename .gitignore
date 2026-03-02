@@ -1,0 +1,4 @@
+node_modules/
+shl-output/
+config.json
+.DS_Store

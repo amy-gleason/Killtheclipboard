@@ -1,0 +1,17 @@
+{
+  "recipient": "Killtheclipboard",
+  "output": {
+    "mode": "file",
+    "directory": "./shl-output",
+    "api": {
+      "url": null,
+      "headers": {}
+    }
+  },
+  "processing": {
+    "pdfScanScale": 2.0,
+    "pdfMaxPages": 10,
+    "maxDecompressedSize": 5000000
+  },
+  "verbose": false
+}
