@@ -64,6 +64,35 @@ export function loadConfig(cliOverrides = {}) {
   const localConfig = loadJsonFile(localPath);
   if (localConfig) config = deepMerge(config, localConfig);
 
+  // Apply environment variables (highest priority for deployed environments)
+  const env = process.env;
+  if (env.OUTPUT_MODE) {
+    config.output.mode = env.OUTPUT_MODE;
+  }
+  if (env.OUTPUT_DIR) {
+    config.output.directory = env.OUTPUT_DIR;
+  }
+  if (env.API_URL) {
+    config.output.mode = config.output.mode === 'file' ? 'api' : config.output.mode;
+    config.output.api.url = env.API_URL;
+  }
+  if (env.FHIR_SERVER) {
+    config.output.mode = config.output.mode === 'file' ? 'api' : config.output.mode;
+    config.output.api.fhirServerBase = env.FHIR_SERVER;
+  }
+  if (env.API_AUTH_HEADER) {
+    config.output.api.headers.Authorization = env.API_AUTH_HEADER;
+  }
+  if (env.ORG_NAME) {
+    config.organization.name = env.ORG_NAME;
+  }
+  if (env.ORG_ID) {
+    config.organization.id = env.ORG_ID;
+  }
+  if (env.RECIPIENT) {
+    config.recipient = env.RECIPIENT;
+  }
+
   // Apply CLI overrides
   if (cliOverrides.output) {
     config.output.directory = cliOverrides.output;
