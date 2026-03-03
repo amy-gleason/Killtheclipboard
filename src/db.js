@@ -63,6 +63,10 @@ function migrate(db) {
     `ALTER TABLE organizations ADD COLUMN onedrive_folder_path TEXT`,
     `ALTER TABLE organizations ADD COLUMN box_refresh_token TEXT`,
     `ALTER TABLE organizations ADD COLUMN box_folder_id TEXT`,
+    `ALTER TABLE organizations ADD COLUMN gmail_refresh_token TEXT`,
+    `ALTER TABLE organizations ADD COLUMN gmail_email TEXT`,
+    `ALTER TABLE organizations ADD COLUMN outlook_refresh_token TEXT`,
+    `ALTER TABLE organizations ADD COLUMN outlook_email TEXT`,
   ];
 
   for (const sql of migrations) {
@@ -115,6 +119,8 @@ export function updateOrgSettings(id, fields) {
     'drive_folder_id', 'drive_refresh_token',
     'onedrive_refresh_token', 'onedrive_folder_path',
     'box_refresh_token', 'box_folder_id',
+    'gmail_refresh_token', 'gmail_email',
+    'outlook_refresh_token', 'outlook_email',
     'api_url', 'api_headers',
     'email_to',
     'admin_password_hash', 'staff_password_hash',

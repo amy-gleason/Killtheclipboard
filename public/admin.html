@@ -674,8 +674,18 @@
           </label>
           <label class="radio-card" onclick="selectStorage('email')">
             <input type="radio" name="storageType" value="email">
-            <div class="radio-card-title">Email</div>
-            <div class="radio-card-desc">Email scan results as attachments.</div>
+            <div class="radio-card-title">Email (SMTP)</div>
+            <div class="radio-card-desc">Email via system SMTP server.</div>
+          </label>
+          <label class="radio-card" onclick="selectStorage('gmail')">
+            <input type="radio" name="storageType" value="gmail">
+            <div class="radio-card-title">Gmail</div>
+            <div class="radio-card-desc">Send via your Gmail account (OAuth).</div>
+          </label>
+          <label class="radio-card" onclick="selectStorage('outlook')">
+            <input type="radio" name="storageType" value="outlook">
+            <div class="radio-card-title">Outlook / M365</div>
+            <div class="radio-card-desc">Send via your Microsoft account (OAuth).</div>
           </label>
         </div>
 
@@ -755,6 +765,40 @@
           </div>
           <div class="help-text" style="margin-top: 4px; padding: 10px 12px; background: var(--color-warn-light); border-left: 3px solid var(--cms-gold-dark); border-radius: 4px;">
             Note: Email requires SMTP configuration by the system administrator.
+          </div>
+        </div>
+
+        <!-- Gmail Config Panel -->
+        <div id="panel-gmail" class="config-panel">
+          <div class="config-panel-title">Gmail Configuration</div>
+          <div class="drive-status">
+            <a href="#" id="gmailConnectBtn" onclick="connectGmail(event)">
+              <button type="button">Connect Gmail</button>
+            </a>
+            <span id="gmailStatusBadge" class="badge not-connected">Not connected</span>
+            <span id="gmailAccountEmail" style="font-size: 0.85rem; color: var(--gray-mid); margin-left: 8px;"></span>
+          </div>
+          <div class="form-group">
+            <label for="gmailEmailTo">Recipient Email</label>
+            <input type="email" id="gmailEmailTo" placeholder="records@clinic.example.com" required>
+            <div class="help-text">Scan results will be sent FROM your connected Gmail account TO this address.</div>
+          </div>
+        </div>
+
+        <!-- Outlook Config Panel -->
+        <div id="panel-outlook" class="config-panel">
+          <div class="config-panel-title">Outlook / Microsoft 365 Configuration</div>
+          <div class="drive-status">
+            <a href="#" id="outlookConnectBtn" onclick="connectOutlook(event)">
+              <button type="button">Connect Microsoft Account</button>
+            </a>
+            <span id="outlookStatusBadge" class="badge not-connected">Not connected</span>
+            <span id="outlookAccountEmail" style="font-size: 0.85rem; color: var(--gray-mid); margin-left: 8px;"></span>
+          </div>
+          <div class="form-group">
+            <label for="outlookEmailTo">Recipient Email</label>
+            <input type="email" id="outlookEmailTo" placeholder="records@clinic.example.com" required>
+            <div class="help-text">Scan results will be sent FROM your connected Microsoft account TO this address.</div>
           </div>
         </div>
 
@@ -975,13 +1019,35 @@
           document.getElementById('boxStatusBadge').textContent = 'Connected';
         }
 
+        // Gmail status
+        if (data.hasGmailToken) {
+          document.getElementById('gmailStatusBadge').className = 'badge connected';
+          document.getElementById('gmailStatusBadge').textContent = 'Connected';
+          if (data.gmailEmail) {
+            document.getElementById('gmailAccountEmail').textContent = '(' + data.gmailEmail + ')';
+          }
+        }
+
+        // Outlook status
+        if (data.hasOutlookToken) {
+          document.getElementById('outlookStatusBadge').className = 'badge connected';
+          document.getElementById('outlookStatusBadge').textContent = 'Connected';
+          if (data.outlookEmail) {
+            document.getElementById('outlookAccountEmail').textContent = '(' + data.outlookEmail + ')';
+          }
+        }
+
         // Field values
         if (data.driveFolderUrl) document.getElementById('driveFolderUrl').value = data.driveFolderUrl;
         if (data.onedriveFolderPath) document.getElementById('onedriveFolderPath').value = data.onedriveFolderPath;
         if (data.boxFolderId) document.getElementById('boxFolderId').value = data.boxFolderId;
         if (data.apiUrl) document.getElementById('apiUrl').value = data.apiUrl;
         if (data.apiHeaders) document.getElementById('apiHeaders').value = typeof data.apiHeaders === 'string' ? data.apiHeaders : JSON.stringify(data.apiHeaders, null, 2);
-        if (data.emailTo) document.getElementById('emailTo').value = data.emailTo;
+        if (data.emailTo) {
+          document.getElementById('emailTo').value = data.emailTo;
+          document.getElementById('gmailEmailTo').value = data.emailTo;
+          document.getElementById('outlookEmailTo').value = data.emailTo;
+        }
 
         // Load version info
         try {
@@ -1061,11 +1127,37 @@
     }
 
     // ============================
+    // Gmail connect
+    // ============================
+    function connectGmail(e) {
+      e.preventDefault();
+      window.location.href = '/api/orgs/' + slug + '/gmail-connect';
+    }
+
+    // ============================
+    // Outlook connect
+    // ============================
+    function connectOutlook(e) {
+      e.preventDefault();
+      window.location.href = '/api/orgs/' + slug + '/outlook-connect';
+    }
+
+    // ============================
     // Save settings
     // ============================
     async function saveSettings() {
       const storageType = document.querySelector('input[name="storageType"]:checked').value;
       const saveFormat = document.querySelector('input[name="saveFormat"]:checked').value;
+
+      // Read emailTo from the active panel
+      let emailTo = '';
+      if (storageType === 'gmail') {
+        emailTo = document.getElementById('gmailEmailTo').value.trim();
+      } else if (storageType === 'outlook') {
+        emailTo = document.getElementById('outlookEmailTo').value.trim();
+      } else {
+        emailTo = document.getElementById('emailTo').value.trim();
+      }
 
       const body = {
         storageType: storageType,
@@ -1075,7 +1167,7 @@
         boxFolderId: document.getElementById('boxFolderId').value.trim(),
         apiUrl: document.getElementById('apiUrl').value.trim(),
         apiHeaders: document.getElementById('apiHeaders').value.trim(),
-        emailTo: document.getElementById('emailTo').value.trim()
+        emailTo: emailTo
       };
 
       // Parse driveFolderId from URL if present

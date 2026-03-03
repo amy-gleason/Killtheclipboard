@@ -1124,6 +1124,8 @@
       const storageLabel = data.storageType === 'drive' ? 'Google Drive'
         : data.storageType === 'onedrive' ? 'OneDrive'
         : data.storageType === 'box' ? 'Box'
+        : data.storageType === 'gmail' ? 'Gmail'
+        : data.storageType === 'outlook' ? 'Outlook'
         : data.storageType;
       const storageError = data.driveError || data.onedriveError || data.boxError;
 

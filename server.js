@@ -13,6 +13,8 @@ import { uploadToDrive, getOAuth2Client, parseFolderId } from './src/output/driv
 import { sendEmail } from './src/output/email-sender.js';
 import { uploadToOnedrive, getOnedriveAuthUrl, exchangeOnedriveCode } from './src/output/onedrive-uploader.js';
 import { uploadToBox, getBoxAuthUrl, exchangeBoxCode } from './src/output/box-uploader.js';
+import { sendViaGmail, getGmailAuthUrl, exchangeGmailCode, getGmailUserEmail } from './src/output/gmail-sender.js';
+import { sendViaOutlook, getOutlookMailAuthUrl, exchangeOutlookMailCode, getOutlookUserEmail } from './src/output/outlook-sender.js';
 import { initDb, createOrg, getOrgBySlug, updateOrgSettings, slugExists } from './src/db.js';
 import { hashPassword, verifyPassword, createToken, authMiddleware } from './src/auth.js';
 import { readFileSync } from 'node:fs';
@@ -375,6 +377,8 @@ app.get('/api/orgs/:slug/config', (req, res) => {
     hasBox: !!org.box_refresh_token,
     hasApi: !!org.api_url,
     hasEmail: !!org.email_to,
+    hasGmail: !!org.gmail_refresh_token,
+    hasOutlook: !!org.outlook_refresh_token,
   });
 });
 
@@ -397,6 +401,10 @@ app.get('/api/orgs/:slug/settings', authMiddleware('admin'), (req, res) => {
     apiUrl: org.api_url || null,
     apiHeaders: org.api_headers ? JSON.parse(org.api_headers) : {},
     emailTo: org.email_to || null,
+    hasGmailToken: !!org.gmail_refresh_token,
+    gmailEmail: org.gmail_email || null,
+    hasOutlookToken: !!org.outlook_refresh_token,
+    outlookEmail: org.outlook_email || null,
   });
 });
 
@@ -408,7 +416,7 @@ app.put('/api/orgs/:slug/settings', authMiddleware('admin'), (req, res) => {
   const { storageType, saveFormat, driveFolderId, apiUrl, apiHeaders, emailTo, onedriveFolderPath, boxFolderId } = req.body;
   const updates = {};
 
-  if (storageType && ['download', 'drive', 'onedrive', 'box', 'api', 'email'].includes(storageType)) {
+  if (storageType && ['download', 'drive', 'onedrive', 'box', 'api', 'email', 'gmail', 'outlook'].includes(storageType)) {
     updates.storage_type = storageType;
   }
   if (saveFormat && ['pdf', 'fhir', 'both'].includes(saveFormat)) {
@@ -526,6 +534,63 @@ app.post('/api/orgs/:slug/test-connection', authMiddleware('admin'), async (req,
 
       await transporter.verify();
       return res.json({ ok: true, message: 'SMTP connection verified.' });
+    }
+
+    if (storageType === 'gmail') {
+      if (!org.gmail_refresh_token) {
+        return res.json({ ok: false, error: 'Gmail not connected. Please connect your Gmail account first.' });
+      }
+      if (!org.email_to) {
+        return res.json({ ok: false, error: 'No email recipient configured.' });
+      }
+      try {
+        const testResp = await fetch('https://oauth2.googleapis.com/token', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({
+            client_id: process.env.GOOGLE_CLIENT_ID,
+            client_secret: process.env.GOOGLE_CLIENT_SECRET,
+            refresh_token: org.gmail_refresh_token,
+            grant_type: 'refresh_token',
+          }).toString(),
+        });
+        if (testResp.ok) {
+          return res.json({ ok: true, message: 'Gmail connected and authorized.' });
+        } else {
+          return res.json({ ok: false, error: 'Gmail token may be expired. Try reconnecting.' });
+        }
+      } catch (err) {
+        return res.json({ ok: false, error: err.message });
+      }
+    }
+
+    if (storageType === 'outlook') {
+      if (!org.outlook_refresh_token) {
+        return res.json({ ok: false, error: 'Outlook not connected. Please connect your Microsoft account first.' });
+      }
+      if (!org.email_to) {
+        return res.json({ ok: false, error: 'No email recipient configured.' });
+      }
+      try {
+        const testResp = await fetch('https://login.microsoftonline.com/common/oauth2/v2.0/token', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({
+            client_id: process.env.ONEDRIVE_CLIENT_ID,
+            client_secret: process.env.ONEDRIVE_CLIENT_SECRET,
+            refresh_token: org.outlook_refresh_token,
+            grant_type: 'refresh_token',
+            scope: 'Mail.Send offline_access',
+          }).toString(),
+        });
+        if (testResp.ok) {
+          return res.json({ ok: true, message: 'Outlook email connected and authorized.' });
+        } else {
+          return res.json({ ok: false, error: 'Outlook token may be expired. Try reconnecting.' });
+        }
+      } catch (err) {
+        return res.json({ ok: false, error: err.message });
+      }
     }
 
     if (storageType === 'onedrive') {
@@ -727,6 +792,143 @@ app.get('/auth/box/callback', async (req, res) => {
   }
 });
 
+// Per-org Gmail OAuth connect
+app.get('/api/orgs/:slug/gmail-connect', (req, res) => {
+  const org = getOrgBySlug(req.params.slug);
+  if (!org) return res.status(404).send('Organization not found.');
+
+  const publicUrl = config.server.publicUrl || `http://localhost:${PORT}`;
+  const redirectUri = `${publicUrl}/auth/gmail/callback`;
+  const state = JSON.stringify({ slug: org.slug, orgId: org.id });
+
+  const authUrl = getGmailAuthUrl(redirectUri, state);
+  if (!authUrl) return res.status(500).send('Google OAuth not configured. Set GOOGLE_CLIENT_ID env var.');
+
+  res.redirect(authUrl);
+});
+
+// Gmail OAuth callback
+app.get('/auth/gmail/callback', async (req, res) => {
+  const { code, state } = req.query;
+  if (!code) return res.status(400).send('No authorization code received.');
+
+  let orgSlug = null, orgId = null;
+  if (state) {
+    try { const p = JSON.parse(state); orgSlug = p.slug; orgId = p.orgId; } catch {}
+  }
+
+  try {
+    const publicUrl = config.server.publicUrl || `http://localhost:${PORT}`;
+    const redirectUri = `${publicUrl}/auth/gmail/callback`;
+    const tokens = await exchangeGmailCode(code, redirectUri);
+
+    if (!tokens.refresh_token) {
+      const backUrl = orgSlug ? `/${orgSlug}/admin` : '/';
+      return res.send(`
+        <html><body style="font-family: Inter, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px;">
+          <h2 style="color: #e31c3d;">No Refresh Token Received</h2>
+          <p>Google did not return a refresh token. This usually means you've already authorized this app before.</p>
+          <p>To fix this: go to <a href="https://myaccount.google.com/permissions">Google Account Permissions</a>,
+          remove "Kill the Clipboard", then try connecting again.</p>
+          <a href="${backUrl}">Go back</a>
+        </body></html>
+      `);
+    }
+
+    // Fetch the connected account's email address
+    let userEmail = null;
+    if (tokens.access_token) {
+      userEmail = await getGmailUserEmail(tokens.access_token);
+    }
+
+    if (orgId) {
+      const updates = { gmail_refresh_token: tokens.refresh_token };
+      if (userEmail) updates.gmail_email = userEmail;
+      updateOrgSettings(orgId, updates);
+    }
+
+    const backUrl = orgSlug ? `/${orgSlug}/admin` : '/';
+    res.send(`
+      <html><body style="font-family: Inter, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px;">
+        <h2 style="color: #2e8540;">Gmail Connected!</h2>
+        <p>Your Gmail account${userEmail ? ` (${userEmail})` : ''} has been connected for sending emails.</p>
+        <a href="${backUrl}" style="display:inline-block;margin-top:12px;padding:10px 20px;background:#0071bc;color:#fff;border-radius:4px;text-decoration:none;font-weight:600;">Back to Admin Settings</a>
+      </body></html>
+    `);
+  } catch (err) {
+    const backUrl = orgSlug ? `/${orgSlug}/admin` : '/';
+    res.status(500).send(`
+      <html><body style="font-family: Inter, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px;">
+        <h2 style="color: #e31c3d;">Gmail Authorization Failed</h2>
+        <p>${err.message}</p>
+        <a href="${backUrl}">Go back</a>
+      </body></html>
+    `);
+  }
+});
+
+// Per-org Outlook OAuth connect
+app.get('/api/orgs/:slug/outlook-connect', (req, res) => {
+  const org = getOrgBySlug(req.params.slug);
+  if (!org) return res.status(404).send('Organization not found.');
+
+  const publicUrl = config.server.publicUrl || `http://localhost:${PORT}`;
+  const redirectUri = `${publicUrl}/auth/outlook/callback`;
+  const state = JSON.stringify({ slug: org.slug, orgId: org.id });
+
+  const authUrl = getOutlookMailAuthUrl(redirectUri, state);
+  if (!authUrl) return res.status(500).send('Microsoft OAuth not configured. Set ONEDRIVE_CLIENT_ID env var.');
+
+  res.redirect(authUrl);
+});
+
+// Outlook OAuth callback
+app.get('/auth/outlook/callback', async (req, res) => {
+  const { code, state } = req.query;
+  if (!code) return res.status(400).send('No authorization code received.');
+
+  let orgSlug = null, orgId = null;
+  if (state) {
+    try { const p = JSON.parse(state); orgSlug = p.slug; orgId = p.orgId; } catch {}
+  }
+
+  try {
+    const publicUrl = config.server.publicUrl || `http://localhost:${PORT}`;
+    const redirectUri = `${publicUrl}/auth/outlook/callback`;
+    const tokens = await exchangeOutlookMailCode(code, redirectUri);
+
+    // Fetch the connected account's email address
+    let userEmail = null;
+    if (tokens.access_token) {
+      userEmail = await getOutlookUserEmail(tokens.access_token);
+    }
+
+    if (orgId && tokens.refresh_token) {
+      const updates = { outlook_refresh_token: tokens.refresh_token };
+      if (userEmail) updates.outlook_email = userEmail;
+      updateOrgSettings(orgId, updates);
+    }
+
+    const backUrl = orgSlug ? `/${orgSlug}/admin` : '/';
+    res.send(`
+      <html><body style="font-family: Inter, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px;">
+        <h2 style="color: #2e8540;">Microsoft Email Connected!</h2>
+        <p>Your Microsoft account${userEmail ? ` (${userEmail})` : ''} has been connected for sending emails.</p>
+        <a href="${backUrl}" style="display:inline-block;margin-top:12px;padding:10px 20px;background:#0071bc;color:#fff;border-radius:4px;text-decoration:none;font-weight:600;">Back to Admin Settings</a>
+      </body></html>
+    `);
+  } catch (err) {
+    const backUrl = orgSlug ? `/${orgSlug}/admin` : '/';
+    res.status(500).send(`
+      <html><body style="font-family: Inter, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px;">
+        <h2 style="color: #e31c3d;">Microsoft Email Authorization Failed</h2>
+        <p>${err.message}</p>
+        <a href="${backUrl}">Go back</a>
+      </body></html>
+    `);
+  }
+});
+
 // Per-org scan (staff or admin auth required)
 app.post('/api/orgs/:slug/scan', authMiddleware('staff'), async (req, res) => {
   const { qrText, passcode } = req.body;
@@ -848,6 +1050,32 @@ app.post('/api/orgs/:slug/scan', authMiddleware('staff'), async (req, res) => {
       } catch (err) {
         emailError = err.message;
         console.error(`[${org.slug}] Email send failed: ${err.message}`);
+      }
+    }
+
+    if (org.storage_type === 'gmail' && org.gmail_refresh_token && org.email_to) {
+      try {
+        await sendViaGmail(filteredResults, {
+          refreshToken: org.gmail_refresh_token,
+          to: org.email_to,
+        }, { verbose: false });
+        emailSent = true;
+      } catch (err) {
+        emailError = err.message;
+        console.error(`[${org.slug}] Gmail send failed: ${err.message}`);
+      }
+    }
+
+    if (org.storage_type === 'outlook' && org.outlook_refresh_token && org.email_to) {
+      try {
+        await sendViaOutlook(filteredResults, {
+          refreshToken: org.outlook_refresh_token,
+          to: org.email_to,
+        }, { verbose: false });
+        emailSent = true;
+      } catch (err) {
+        emailError = err.message;
+        console.error(`[${org.slug}] Outlook send failed: ${err.message}`);
       }
     }
 
