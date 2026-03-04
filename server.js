@@ -242,7 +242,7 @@ app.get('/auth/google/callback', async (req, res) => {
 
     // Per-org flow: save refresh token to database
     if (orgSlug && orgId) {
-      updateOrgSettings(orgId, { drive_refresh_token: refreshToken });
+      updateOrgSettings(orgId, { drive_refresh_token: refreshToken, storage_type: 'drive' });
 
       return res.send(`
         <html><body style="font-family: Inter, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px;">
@@ -727,7 +727,7 @@ app.get('/auth/onedrive/callback', async (req, res) => {
     const tokens = await exchangeOnedriveCode(code, redirectUri);
 
     if (orgId && tokens.refresh_token) {
-      updateOrgSettings(orgId, { onedrive_refresh_token: tokens.refresh_token });
+      updateOrgSettings(orgId, { onedrive_refresh_token: tokens.refresh_token, storage_type: 'onedrive' });
     }
 
     const backUrl = orgSlug ? `/${orgSlug}/admin` : '/';
@@ -781,7 +781,7 @@ app.get('/auth/box/callback', async (req, res) => {
     const tokens = await exchangeBoxCode(code, redirectUri);
 
     if (orgId && tokens.refresh_token) {
-      updateOrgSettings(orgId, { box_refresh_token: tokens.refresh_token });
+      updateOrgSettings(orgId, { box_refresh_token: tokens.refresh_token, storage_type: 'box' });
     }
 
     const backUrl = orgSlug ? `/${orgSlug}/admin` : '/';
@@ -854,7 +854,7 @@ app.get('/auth/gmail/callback', async (req, res) => {
     }
 
     if (orgId) {
-      const updates = { gmail_refresh_token: tokens.refresh_token };
+      const updates = { gmail_refresh_token: tokens.refresh_token, storage_type: 'gmail' };
       if (userEmail) updates.gmail_email = userEmail;
       updateOrgSettings(orgId, updates);
     }
@@ -916,7 +916,7 @@ app.get('/auth/outlook/callback', async (req, res) => {
     }
 
     if (orgId && tokens.refresh_token) {
-      const updates = { outlook_refresh_token: tokens.refresh_token };
+      const updates = { outlook_refresh_token: tokens.refresh_token, storage_type: 'outlook' };
       if (userEmail) updates.outlook_email = userEmail;
       updateOrgSettings(orgId, updates);
     }
