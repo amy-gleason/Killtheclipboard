@@ -1278,33 +1278,26 @@
         return;
       }
 
-      const headersRaw = document.getElementById('apiHeaders').value.trim();
-      let headers = {};
-      if (headersRaw) {
-        try {
-          headers = JSON.parse(headersRaw);
-        } catch (e) {
-          document.getElementById('testStatus').textContent = 'Invalid JSON in headers.';
-          document.getElementById('testStatus').style.color = 'var(--color-error)';
-          return;
-        }
-      }
-
-      document.getElementById('testStatus').textContent = 'Testing...';
+      document.getElementById('testStatus').textContent = 'Saving & testing...';
       document.getElementById('testStatus').style.color = 'var(--gray-mid)';
 
+      // Save settings first so the server has the URL, then test via server-side
       try {
-        const resp = await fetch(url, {
+        await saveSettings();
+        const resp = await fetch('/api/orgs/' + slug + '/test-connection', {
           method: 'POST',
-          headers: Object.assign({ 'Content-Type': 'application/json' }, headers),
-          body: JSON.stringify({ test: true, source: 'kill-the-clipboard', timestamp: new Date().toISOString() })
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + token
+          },
+          body: JSON.stringify({ storageType: 'api' })
         });
-
-        if (resp.ok) {
-          document.getElementById('testStatus').textContent = 'Success (' + resp.status + ')';
+        const data = await resp.json();
+        if (data.ok) {
+          document.getElementById('testStatus').textContent = data.message || 'Success';
           document.getElementById('testStatus').style.color = 'var(--color-success)';
         } else {
-          document.getElementById('testStatus').textContent = 'Failed (' + resp.status + ')';
+          document.getElementById('testStatus').textContent = data.error || 'Test failed';
           document.getElementById('testStatus').style.color = 'var(--color-error)';
         }
       } catch (err) {
