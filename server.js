@@ -2,7 +2,7 @@ import express from 'express';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { networkInterfaces } from 'node:os';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { loadConfig } from './src/config.js';
 import { parseShlUri } from './src/shl/uri-parser.js';
 import { fetchManifest } from './src/shl/manifest.js';
@@ -18,6 +18,7 @@ import { sendViaOutlook, getOutlookMailAuthUrl, exchangeOutlookMailCode, getOutl
 import { initDb, getDb, createOrg, getOrgBySlug, getOrgById, updateOrgSettings, slugExists, listAllOrgs, deleteOrgById, countOrgs, createApprovalRequest, listApprovalRequests, updateApprovalRequest, getDecryptedToken, prepareTokenForStorage, logAuditEvent, listAuditLog, listAllAuditLog } from './src/db.js';
 import { hashPassword, verifyPassword, createToken, authMiddleware } from './src/auth.js';
 import { readFileSync } from 'node:fs';
+import rateLimit from 'express-rate-limit';
 
 // Load version from package.json at startup
 const pkg = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'package.json'), 'utf-8'));
@@ -121,7 +122,83 @@ const APPROVED_APPS = [
   { appId: 'yosi-health', name: 'Yosi Health', tier: 'pledgee' },
 ];
 
-app.use(express.json({ limit: '50mb' }));
+app.use(express.json({ limit: '10mb' }));
+
+// ── Server-side HTML escaping (for OAuth error pages) ──
+function escapeHtml(str) {
+  if (str == null) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// ── Slug validation (for OAuth state parameters) ──
+function isValidSlug(slug) {
+  return typeof slug === 'string' && /^[a-z][a-z0-9-]{1,49}$/.test(slug);
+}
+
+// ── HMAC-signed OAuth state (CSRF protection) ──
+// Prevents attackers from forging state to link their storage to a victim's org.
+import { createHmac as _createHmac } from 'node:crypto';
+
+function createSignedOAuthState(slug, orgId) {
+  const payload = JSON.stringify({ slug, orgId });
+  const secret = process.env.SESSION_SECRET || 'oauth-state-fallback';
+  const sig = _createHmac('sha256', secret).update(payload).digest('base64url');
+  return JSON.stringify({ slug, orgId, sig });
+}
+
+function verifyOAuthState(stateString) {
+  if (!stateString) return null;
+  try {
+    const parsed = JSON.parse(stateString);
+    if (!parsed.sig || !parsed.slug) return null;
+
+    const payload = JSON.stringify({ slug: parsed.slug, orgId: parsed.orgId });
+    const secret = process.env.SESSION_SECRET || 'oauth-state-fallback';
+    const expectedSig = _createHmac('sha256', secret).update(payload).digest('base64url');
+
+    const sigBuf = Buffer.from(parsed.sig);
+    const expectedBuf = Buffer.from(expectedSig);
+    if (sigBuf.length !== expectedBuf.length || !timingSafeEqual(sigBuf, expectedBuf)) {
+      return null;
+    }
+
+    if (!isValidSlug(parsed.slug)) return null;
+    return { slug: parsed.slug, orgId: parsed.orgId };
+  } catch {
+    return null;
+  }
+}
+
+// ── Rate Limiting ──
+// Protect auth endpoints against brute-force and proxy endpoints against abuse.
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 20,                    // 20 attempts per window per IP
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many authentication attempts. Please try again later.' },
+});
+
+const proxyLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000,  // 1 minute
+  max: 30,                    // 30 requests per minute per IP
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests. Please slow down.' },
+});
+
+const registrationLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 5,                    // 5 registrations per hour per IP
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many registration attempts. Please try again later.' },
+});
 
 // ── Content Security Policy ──
 // Mitigates XSS by restricting which scripts, styles, and connections are allowed.
@@ -333,14 +410,12 @@ app.get('/auth/google/callback', async (req, res) => {
   }
 
   // Parse state to check if this is a per-org OAuth flow
+  // State is HMAC-signed to prevent CSRF — attacker can't forge valid state.
   let orgSlug = null;
   let orgId = null;
   if (state) {
-    try {
-      const parsed = JSON.parse(state);
-      orgSlug = parsed.slug;
-      orgId = parsed.orgId;
-    } catch {}
+    const verified = verifyOAuthState(state);
+    if (verified) { orgSlug = verified.slug; orgId = verified.orgId; }
   }
 
   try {
@@ -348,7 +423,7 @@ app.get('/auth/google/callback', async (req, res) => {
     const refreshToken = tokens.refresh_token;
 
     if (!refreshToken) {
-      const backUrl = orgSlug ? `/${orgSlug}/admin` : '/';
+      const backUrl = orgSlug ? `/${escapeHtml(orgSlug)}/admin` : '/';
       return res.send(`
         <html><body style="font-family: Inter, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px;">
           <h2 style="color: #e31c3d;">No Refresh Token Received</h2>
@@ -369,27 +444,27 @@ app.get('/auth/google/callback', async (req, res) => {
           <h2 style="color: #2e8540;">Google Drive Connected!</h2>
           <p>Your organization's Google Drive has been connected successfully.</p>
           <p>You can now configure the Drive folder in your admin settings.</p>
-          <a href="/${orgSlug}/admin" style="display:inline-block;margin-top:12px;padding:10px 20px;background:#0071bc;color:#fff;border-radius:4px;text-decoration:none;font-weight:600;">Back to Admin Settings</a>
+          <a href="/${escapeHtml(orgSlug)}/admin" style="display:inline-block;margin-top:12px;padding:10px 20px;background:#0071bc;color:#fff;border-radius:4px;text-decoration:none;font-weight:600;">Back to Admin Settings</a>
         </body></html>
       `);
     }
 
-    // Legacy flow: show flyctl command
+    // Legacy flow: show flyctl command (token escaped to prevent HTML breakout)
     res.send(`
       <html><body style="font-family: Inter, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px;">
         <h2 style="color: #2e8540;">Google Drive Connected!</h2>
         <p>Your refresh token has been generated. Run this command to save it to your deployment:</p>
-        <pre style="background: #f1f1f1; padding: 16px; border-radius: 4px; overflow-x: auto; font-size: 0.85rem;">flyctl secrets set GOOGLE_REFRESH_TOKEN="${refreshToken}"</pre>
+        <pre style="background: #f1f1f1; padding: 16px; border-radius: 4px; overflow-x: auto; font-size: 0.85rem;">flyctl secrets set GOOGLE_REFRESH_TOKEN="${escapeHtml(refreshToken)}"</pre>
         <p style="margin-top: 16px;">After running that command, the app will automatically upload scanned data to your Google Drive folder.</p>
         <a href="/">Back to scanner</a>
       </body></html>
     `);
   } catch (err) {
-    const backUrl = orgSlug ? `/${orgSlug}/admin` : '/';
+    const backUrl = orgSlug ? `/${escapeHtml(orgSlug)}/admin` : '/';
     res.status(500).send(`
       <html><body style="font-family: Inter, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px;">
         <h2 style="color: #e31c3d;">Authorization Failed</h2>
-        <p>${err.message}</p>
+        <p>${escapeHtml(err.message)}</p>
         <a href="${backUrl}">Go back</a>
       </body></html>
     `);
@@ -436,7 +511,7 @@ app.get('/api/verify-app', (req, res) => {
 // ══════════════════════════════════════════════════════════════════
 
 // Register a new organization
-app.post('/api/orgs', async (req, res) => {
+app.post('/api/orgs', registrationLimiter, async (req, res) => {
   const { slug, name, adminPassword, staffPassword } = req.body;
 
   if (!slug || !name || !adminPassword || !staffPassword) {
@@ -495,7 +570,7 @@ app.get('/api/orgs/check-slug', (req, res) => {
 });
 
 // Authenticate as admin or staff
-app.post('/api/orgs/:slug/auth', async (req, res) => {
+app.post('/api/orgs/:slug/auth', authLimiter, async (req, res) => {
   const { password, role } = req.body;
   const org = getOrgBySlug(req.params.slug);
 
@@ -848,7 +923,7 @@ app.get('/api/orgs/:slug/drive-connect', (req, res) => {
     access_type: 'offline',
     prompt: 'consent',
     scope: ['https://www.googleapis.com/auth/drive.file'],
-    state: JSON.stringify({ slug: org.slug, orgId: org.id }),
+    state: createSignedOAuthState(org.slug, org.id),
   });
 
   res.redirect(authUrl);
@@ -861,7 +936,7 @@ app.get('/api/orgs/:slug/onedrive-connect', (req, res) => {
 
   const publicUrl = config.server.publicUrl || `http://localhost:${PORT}`;
   const redirectUri = `${publicUrl}/auth/onedrive/callback`;
-  const state = JSON.stringify({ slug: org.slug, orgId: org.id });
+  const state = createSignedOAuthState(org.slug, org.id);
 
   const authUrl = getOnedriveAuthUrl(redirectUri, state);
   if (!authUrl) return res.status(500).send('OneDrive not configured. Set ONEDRIVE_CLIENT_ID env var.');
@@ -876,7 +951,8 @@ app.get('/auth/onedrive/callback', async (req, res) => {
 
   let orgSlug = null, orgId = null;
   if (state) {
-    try { const p = JSON.parse(state); orgSlug = p.slug; orgId = p.orgId; } catch {}
+    const verified = verifyOAuthState(state);
+    if (verified) { orgSlug = verified.slug; orgId = verified.orgId; }
   }
 
   try {
@@ -897,11 +973,11 @@ app.get('/auth/onedrive/callback', async (req, res) => {
       </body></html>
     `);
   } catch (err) {
-    const backUrl = orgSlug ? `/${orgSlug}/admin` : '/';
+    const backUrl = orgSlug ? `/${escapeHtml(orgSlug)}/admin` : '/';
     res.status(500).send(`
       <html><body style="font-family: Inter, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px;">
         <h2 style="color: #e31c3d;">OneDrive Authorization Failed</h2>
-        <p>${err.message}</p>
+        <p>${escapeHtml(err.message)}</p>
         <a href="${backUrl}">Go back</a>
       </body></html>
     `);
@@ -915,7 +991,7 @@ app.get('/api/orgs/:slug/box-connect', (req, res) => {
 
   const publicUrl = config.server.publicUrl || `http://localhost:${PORT}`;
   const redirectUri = `${publicUrl}/auth/box/callback`;
-  const state = JSON.stringify({ slug: org.slug, orgId: org.id });
+  const state = createSignedOAuthState(org.slug, org.id);
 
   const authUrl = getBoxAuthUrl(redirectUri, state);
   if (!authUrl) return res.status(500).send('Box not configured. Set BOX_CLIENT_ID env var.');
@@ -930,7 +1006,8 @@ app.get('/auth/box/callback', async (req, res) => {
 
   let orgSlug = null, orgId = null;
   if (state) {
-    try { const p = JSON.parse(state); orgSlug = p.slug; orgId = p.orgId; } catch {}
+    const verified = verifyOAuthState(state);
+    if (verified) { orgSlug = verified.slug; orgId = verified.orgId; }
   }
 
   try {
@@ -951,11 +1028,11 @@ app.get('/auth/box/callback', async (req, res) => {
       </body></html>
     `);
   } catch (err) {
-    const backUrl = orgSlug ? `/${orgSlug}/admin` : '/';
+    const backUrl = orgSlug ? `/${escapeHtml(orgSlug)}/admin` : '/';
     res.status(500).send(`
       <html><body style="font-family: Inter, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px;">
         <h2 style="color: #e31c3d;">Box Authorization Failed</h2>
-        <p>${err.message}</p>
+        <p>${escapeHtml(err.message)}</p>
         <a href="${backUrl}">Go back</a>
       </body></html>
     `);
@@ -969,7 +1046,7 @@ app.get('/api/orgs/:slug/gmail-connect', (req, res) => {
 
   const publicUrl = config.server.publicUrl || `http://localhost:${PORT}`;
   const redirectUri = `${publicUrl}/auth/gmail/callback`;
-  const state = JSON.stringify({ slug: org.slug, orgId: org.id });
+  const state = createSignedOAuthState(org.slug, org.id);
 
   const authUrl = getGmailAuthUrl(redirectUri, state);
   if (!authUrl) return res.status(500).send('Google OAuth not configured. Set GOOGLE_CLIENT_ID env var.');
@@ -984,7 +1061,8 @@ app.get('/auth/gmail/callback', async (req, res) => {
 
   let orgSlug = null, orgId = null;
   if (state) {
-    try { const p = JSON.parse(state); orgSlug = p.slug; orgId = p.orgId; } catch {}
+    const verified = verifyOAuthState(state);
+    if (verified) { orgSlug = verified.slug; orgId = verified.orgId; }
   }
 
   try {
@@ -1021,16 +1099,16 @@ app.get('/auth/gmail/callback', async (req, res) => {
     res.send(`
       <html><body style="font-family: Inter, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px;">
         <h2 style="color: #2e8540;">Gmail Connected!</h2>
-        <p>Your Gmail account${userEmail ? ` (${userEmail})` : ''} has been connected for sending emails.</p>
+        <p>Your Gmail account${userEmail ? ` (${escapeHtml(userEmail)})` : ''} has been connected for sending emails.</p>
         <a href="${backUrl}" style="display:inline-block;margin-top:12px;padding:10px 20px;background:#0071bc;color:#fff;border-radius:4px;text-decoration:none;font-weight:600;">Back to Admin Settings</a>
       </body></html>
     `);
   } catch (err) {
-    const backUrl = orgSlug ? `/${orgSlug}/admin` : '/';
+    const backUrl = orgSlug ? `/${escapeHtml(orgSlug)}/admin` : '/';
     res.status(500).send(`
       <html><body style="font-family: Inter, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px;">
         <h2 style="color: #e31c3d;">Gmail Authorization Failed</h2>
-        <p>${err.message}</p>
+        <p>${escapeHtml(err.message)}</p>
         <a href="${backUrl}">Go back</a>
       </body></html>
     `);
@@ -1044,7 +1122,7 @@ app.get('/api/orgs/:slug/outlook-connect', (req, res) => {
 
   const publicUrl = config.server.publicUrl || `http://localhost:${PORT}`;
   const redirectUri = `${publicUrl}/auth/outlook/callback`;
-  const state = JSON.stringify({ slug: org.slug, orgId: org.id });
+  const state = createSignedOAuthState(org.slug, org.id);
 
   const authUrl = getOutlookMailAuthUrl(redirectUri, state);
   if (!authUrl) return res.status(500).send('Microsoft OAuth not configured. Set ONEDRIVE_CLIENT_ID env var.');
@@ -1059,7 +1137,8 @@ app.get('/auth/outlook/callback', async (req, res) => {
 
   let orgSlug = null, orgId = null;
   if (state) {
-    try { const p = JSON.parse(state); orgSlug = p.slug; orgId = p.orgId; } catch {}
+    const verified = verifyOAuthState(state);
+    if (verified) { orgSlug = verified.slug; orgId = verified.orgId; }
   }
 
   try {
@@ -1083,16 +1162,16 @@ app.get('/auth/outlook/callback', async (req, res) => {
     res.send(`
       <html><body style="font-family: Inter, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px;">
         <h2 style="color: #2e8540;">Microsoft Email Connected!</h2>
-        <p>Your Microsoft account${userEmail ? ` (${userEmail})` : ''} has been connected for sending emails.</p>
+        <p>Your Microsoft account${userEmail ? ` (${escapeHtml(userEmail)})` : ''} has been connected for sending emails.</p>
         <a href="${backUrl}" style="display:inline-block;margin-top:12px;padding:10px 20px;background:#0071bc;color:#fff;border-radius:4px;text-decoration:none;font-weight:600;">Back to Admin Settings</a>
       </body></html>
     `);
   } catch (err) {
-    const backUrl = orgSlug ? `/${orgSlug}/admin` : '/';
+    const backUrl = orgSlug ? `/${escapeHtml(orgSlug)}/admin` : '/';
     res.status(500).send(`
       <html><body style="font-family: Inter, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px;">
         <h2 style="color: #e31c3d;">Microsoft Email Authorization Failed</h2>
-        <p>${err.message}</p>
+        <p>${escapeHtml(err.message)}</p>
         <a href="${backUrl}">Go back</a>
       </body></html>
     `);
@@ -1113,24 +1192,33 @@ function isPrivateUrl(urlString) {
     const url = new URL(urlString);
     const hostname = url.hostname.toLowerCase();
 
+    // Block non-HTTP protocols first
+    if (!['http:', 'https:'].includes(url.protocol)) return true;
+
     // Block private IPs and localhost
     if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1') return true;
     if (hostname === '0.0.0.0') return true;
     if (hostname.endsWith('.local')) return true;
     if (hostname.endsWith('.internal')) return true;
 
-    // Block RFC 1918 ranges
-    const parts = hostname.split('.');
-    if (parts.length === 4 && parts.every(p => /^\d+$/.test(p))) {
-      const [a, b] = parts.map(Number);
-      if (a === 10) return true;                          // 10.0.0.0/8
-      if (a === 172 && b >= 16 && b <= 31) return true;  // 172.16.0.0/12
-      if (a === 192 && b === 168) return true;            // 192.168.0.0/16
-      if (a === 169 && b === 254) return true;            // 169.254.0.0/16 (link-local)
+    // Block cloud metadata endpoints (AWS, GCP, Azure)
+    if (hostname === '169.254.169.254') return true;
+    if (hostname === 'metadata.google.internal') return true;
+
+    // Block IPv6-mapped IPv4 addresses (e.g., ::ffff:127.0.0.1)
+    const ipv6MappedMatch = hostname.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+    if (ipv6MappedMatch) {
+      // Re-check the embedded IPv4 address
+      return isPrivateIpv4(ipv6MappedMatch[1]);
     }
 
-    // Block non-HTTP protocols
-    if (!['http:', 'https:'].includes(url.protocol)) return true;
+    // Block IPv6 private ranges
+    if (hostname.startsWith('fe80:')) return true;   // Link-local
+    if (hostname.startsWith('fc') || hostname.startsWith('fd')) return true; // Unique local
+    if (hostname === '::') return true;               // Unspecified
+
+    // Block RFC 1918 ranges (IPv4)
+    if (isPrivateIpv4(hostname)) return true;
 
     return false;
   } catch {
@@ -1138,9 +1226,21 @@ function isPrivateUrl(urlString) {
   }
 }
 
+function isPrivateIpv4(hostname) {
+  const parts = hostname.split('.');
+  if (parts.length !== 4 || !parts.every(p => /^\d+$/.test(p))) return false;
+  const [a, b] = parts.map(Number);
+  if (a === 10) return true;                          // 10.0.0.0/8
+  if (a === 172 && b >= 16 && b <= 31) return true;  // 172.16.0.0/12
+  if (a === 192 && b === 168) return true;            // 192.168.0.0/16
+  if (a === 169 && b === 254) return true;            // 169.254.0.0/16 (link-local)
+  if (a === 127) return true;                          // 127.0.0.0/8 (loopback)
+  return false;
+}
+
 // SHL CORS Proxy — forwards encrypted requests to SHL manifest servers
 // The decryption key never leaves the browser. Server only sees encrypted JWE blobs.
-app.post('/api/orgs/:slug/shl-proxy', authMiddleware('staff'), async (req, res) => {
+app.post('/api/orgs/:slug/shl-proxy', proxyLimiter, authMiddleware('staff'), async (req, res) => {
   const { url, method = 'GET', body = null, headers = {} } = req.body;
 
   if (!url) {
@@ -1156,6 +1256,7 @@ app.post('/api/orgs/:slug/shl-proxy', authMiddleware('staff'), async (req, res) 
     const fetchOptions = {
       method: method.toUpperCase(),
       headers: {},
+      redirect: 'manual',  // Don't follow redirects — prevents SSRF via redirect to private IPs
     };
 
     // Only allow safe headers to be forwarded
@@ -1173,7 +1274,28 @@ app.post('/api/orgs/:slug/shl-proxy', authMiddleware('staff'), async (req, res) 
       }
     }
 
-    const proxyResp = await fetch(url, fetchOptions);
+    let proxyResp = await fetch(url, fetchOptions);
+
+    // Handle redirects safely — validate each redirect target against SSRF
+    let redirectCount = 0;
+    const MAX_REDIRECTS = 3;
+    while (proxyResp.status >= 300 && proxyResp.status < 400 && redirectCount < MAX_REDIRECTS) {
+      const location = proxyResp.headers.get('location');
+      if (!location) break;
+
+      const redirectUrl = new URL(location, url).toString();
+      if (isPrivateUrl(redirectUrl)) {
+        return res.status(403).json({ error: 'Redirect to private/internal address blocked' });
+      }
+
+      proxyResp = await fetch(redirectUrl, { ...fetchOptions, method: 'GET' });
+      redirectCount++;
+    }
+
+    if (redirectCount >= MAX_REDIRECTS) {
+      return res.status(502).json({ error: 'Too many redirects from SHL server' });
+    }
+
     const responseText = await proxyResp.text();
 
     // Return the raw response so the browser can handle decryption
@@ -1716,14 +1838,21 @@ app.get('/api/orgs/:slug/audit-log', authMiddleware('admin'), (req, res) => {
 // ── Super-admin middleware ──
 function superAdminAuth(req, res, next) {
   const key = req.headers['x-admin-key'];
-  if (!key || key !== (process.env.ADMIN_KEY || 'ktc-admin-2026')) {
+  const expected = process.env.ADMIN_KEY || 'ktc-admin-2026';
+  if (!key || typeof key !== 'string') {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  // Timing-safe comparison to prevent timing side-channel attacks
+  const keyBuf = Buffer.from(key);
+  const expectedBuf = Buffer.from(expected);
+  if (keyBuf.length !== expectedBuf.length || !timingSafeEqual(keyBuf, expectedBuf)) {
     return res.status(403).json({ error: 'Forbidden' });
   }
   next();
 }
 
 // Super-admin: list all pending approval requests
-app.get('/api/admin/approval-requests', superAdminAuth, (req, res) => {
+app.get('/api/admin/approval-requests', authLimiter, superAdminAuth, (req, res) => {
   const requests = listApprovalRequests(req.query.status || null);
   res.json(requests);
 });

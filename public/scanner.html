@@ -988,6 +988,18 @@
         .replace(/'/g, '&#39;');
     }
 
+    // Validate that a string is safe base64 (only A-Za-z0-9+/= characters).
+    // Prevents attribute injection via crafted base64 in <embed src="data:...">.
+    function isSafeBase64(str) {
+      return typeof str === 'string' && /^[A-Za-z0-9+/=\s]+$/.test(str);
+    }
+
+    // Validate that a URL uses https: protocol only.
+    // Prevents javascript: and data: URI injection in href/src attributes.
+    function isSafeUrl(url) {
+      try { return new URL(url).protocol === 'https:'; } catch { return false; }
+    }
+
     // === Multi-tenant state ===
     const slug = window.location.pathname.split('/').filter(Boolean)[0];
     let orgConfig = null;
@@ -1331,7 +1343,7 @@
             </div>
             <h3>Saved to ${escapeHtml(storageLabel)}</h3>
             <p>${parseInt(data.summary.fhirBundles) || 0} FHIR bundle(s) and ${parseInt(data.summary.pdfs) || 0} PDF(s) uploaded successfully.</p>
-            <a href="${escapeHtml(folderLink)}" target="_blank" class="open-folder-btn">Open Folder</a>
+            ${isSafeUrl(folderLink) ? `<a href="${escapeHtml(folderLink)}" target="_blank" class="open-folder-btn">Open Folder</a>` : ''}
             <button class="scan-again-btn" onclick="resetForNewScan()">Scan Another</button>
           </div>`;
       } else if (storageError) {
@@ -1395,7 +1407,7 @@
         if (data.pdfs && data.pdfs.length > 0) {
           for (let pi = 0; pi < data.pdfs.length; pi++) {
             const pdf = data.pdfs[pi];
-            if (pdf.dataBase64) {
+            if (pdf.dataBase64 && isSafeBase64(pdf.dataBase64)) {
               downloadItems.push({ name: pdf.filename, base64: pdf.dataBase64, type: 'application/pdf' });
               downloadHtml += `<button class="download-btn" data-download-index="${downloadItems.length - 1}">Download ${escapeHtml(pdf.filename)}</button>`;
             }
@@ -1458,14 +1470,14 @@
         let pdfHtml = '<div class="pdf-preview-container">';
         for (const pdf of data.pdfs) {
           const safeName = escapeHtml(pdf.filename);
-          if (pdf.dataBase64) {
+          if (pdf.dataBase64 && isSafeBase64(pdf.dataBase64)) {
             hasPreviews = true;
             pdfHtml += `
               <div class="pdf-preview-item">
                 <div class="pdf-label">${safeName}</div>
                 <embed src="data:application/pdf;base64,${pdf.dataBase64}" type="application/pdf">
               </div>`;
-          } else if (pdf.url) {
+          } else if (pdf.url && isSafeUrl(pdf.url)) {
             hasPreviews = true;
             pdfHtml += `
               <div class="pdf-preview-item">

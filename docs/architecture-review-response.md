@@ -134,3 +134,75 @@ These requirements justify the server components we maintain. We've minimized th
 | Fully static architecture | ❌ Disagree for current requirements — health systems need automated routing |
 
 We'd welcome a follow-up conversation on the items marked for discussion, particularly around the tradeoffs between stored credentials and staff-directed file saving in a healthcare front-desk environment.
+
+---
+
+## Appendix: QR Security Deep-Dive — Additional Findings and Fixes
+
+Following the initial architecture review fixes, we conducted a deeper security audit focused on QR code attack surfaces and general application hardening. This audit identified 15 findings across critical, high, medium, and low severities. All critical and high-severity items have been fixed.
+
+### Finding 1 (Critical): Unescaped Base64 in PDF Embed `src`
+**Status: Fixed.**
+
+PDF data embedded via `<embed src="data:application/pdf;base64,${data}">` could allow attribute breakout if the base64 payload contained `"` characters. We added a `isSafeBase64()` validator that rejects any string containing characters outside `[A-Za-z0-9+/=\s]` before embedding. Invalid payloads show an error message instead of rendering.
+
+### Finding 2 (Critical): No `javascript:` URI Filtering on Links
+**Status: Fixed.**
+
+Folder links and PDF URLs from server responses were rendered as `href` values without protocol validation. A malicious server response could inject `javascript:` URIs. We added an `isSafeUrl()` validator that requires `https:` protocol via `new URL(url).protocol === 'https:'`. Links that fail validation are removed or replaced with safe text.
+
+### Finding 3 (High): Server-Side XSS in OAuth Callbacks
+**Status: Fixed.**
+
+All five OAuth callback handlers (Google Drive, OneDrive, Box, Gmail, Outlook) rendered `err.message` and `orgSlug` directly into HTML error pages via template literals. An attacker who controlled the OAuth error response or state parameter could inject HTML/JavaScript. All values are now escaped with a server-side `escapeHtml()` function before interpolation. Email addresses from OAuth providers are also escaped in success pages.
+
+### Finding 4 (High): OAuth State CSRF
+**Status: Fixed.**
+
+OAuth state parameters previously contained unsigned JSON (`{slug, orgId}`). An attacker could forge state to link their storage account to a victim's organization, causing PHI to be routed to the attacker's storage. State parameters are now HMAC-signed with `SESSION_SECRET` using `createSignedOAuthState()`. Callbacks verify the signature with timing-safe comparison via `verifyOAuthState()`. Forged state is silently rejected.
+
+### Finding 5 (High): No Rate Limiting
+**Status: Fixed.**
+
+No endpoints had rate limiting, making brute-force attacks trivial (especially with staff passwords as short as 4 characters). We added `express-rate-limit` with three tiers:
+- **Auth endpoints** (`/api/orgs/:slug/auth`): 20 attempts per 15 minutes per IP
+- **CORS proxy** (`/api/orgs/:slug/shl-proxy`): 30 requests per minute per IP
+- **Registration** (`/api/orgs`): 5 registrations per hour per IP
+- **Super-admin endpoints**: share the auth rate limiter
+
+### Finding 6 (High): CORS Proxy SSRF Bypasses
+**Status: Fixed.**
+
+The original SSRF protection blocked IPv4 private ranges but missed several bypass vectors:
+- **IPv6-mapped IPv4:** `::ffff:127.0.0.1` bypassed IPv4 checks. Added explicit IPv6-mapped address detection and re-validation.
+- **IPv6 private ranges:** Added blocking for link-local (`fe80:`), unique-local (`fc`/`fd`), and unspecified (`::`) addresses.
+- **Cloud metadata endpoints:** Added explicit blocking for `169.254.169.254` (AWS/GCP) and `metadata.google.internal`.
+- **Redirect-based bypass:** The proxy followed HTTP redirects, so an attacker's server could 302-redirect to `http://169.254.169.254`. Added `redirect: 'manual'` to fetch options with safe redirect handling — each redirect target is validated against the SSRF blocklist before following, with a maximum of 3 redirects.
+- **Loopback expansion:** Added `127.0.0.0/8` to private IPv4 checks (previously only blocked `127.0.0.1`).
+
+### Finding 7 (Medium): Token Signature Not Timing-Safe
+**Status: Fixed.**
+
+Session token HMAC verification in `auth.js` used `!==` (string comparison), which leaks information about the expected signature through timing differences. Replaced with `crypto.timingSafeEqual()` for both session tokens and super-admin API key verification.
+
+### Finding 8 (Medium): 50MB JSON Body Limit
+**Status: Fixed.**
+
+The Express JSON body parser accepted up to 50MB payloads, creating a denial-of-service vector. Reduced to 10MB, which is still generous for FHIR bundles with embedded PDF data.
+
+### Remaining Items (Lower Severity)
+
+| Finding | Severity | Status | Notes |
+|---|---|---|---|
+| CSP allows `unsafe-inline` | Low | Accepted | Required for current UI approach; mitigated by SRI and connect-src restrictions |
+| Token in sessionStorage | Low | Accepted | Intentional — sessionStorage is tab-scoped and cleared on close, better than localStorage for PHI-adjacent apps |
+| Refresh token passed through HTML | Medium | Mitigated | Tokens are encrypted at rest; HTML page is served over TLS only to the authorized user completing the OAuth flow |
+
+### Implementation Files
+
+| File | Changes |
+|---|---|
+| `public/scanner.html` | `isSafeBase64()`, `isSafeUrl()` validators; base64 validation on embeds; URL protocol validation on links |
+| `server.js` | `escapeHtml()` on all OAuth HTML; `createSignedOAuthState()`/`verifyOAuthState()` CSRF protection; rate limiters; CORS proxy hardening (IPv6, cloud metadata, redirect validation); `timingSafeEqual` for super-admin auth; JSON body limit reduced |
+| `src/auth.js` | `timingSafeEqual` for session token HMAC verification |
+| `package.json` | Added `express-rate-limit` dependency |

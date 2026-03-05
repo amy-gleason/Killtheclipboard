@@ -1,6 +1,6 @@
 # Kill the Clipboard — Security & Compliance Specification
 
-**Version:** 1.3 — XSS Hardening, SRI, and Audit Logging
+**Version:** 1.4 — Rate Limiting, SSRF Hardening, OAuth CSRF Protection, Timing-Safe Comparisons
 **Date:** March 4, 2026
 **Classification:** For distribution to CISO and compliance review teams
 **Contact:** agleason@russellstreetventures.com
@@ -322,9 +322,11 @@ The JWE decryptor explicitly restricts accepted algorithms:
 
 The server includes a CORS proxy endpoint that bridges browser requests to SHL manifest servers. This proxy has strict security controls:
 
-- **SSRF protection:** Blocks requests to private/internal IP ranges (RFC 1918), localhost, link-local, and non-HTTP protocols
+- **SSRF protection:** Blocks requests to private/internal IP ranges (RFC 1918, RFC 4193), localhost, link-local, cloud metadata endpoints (169.254.169.254, metadata.google.internal), IPv6-mapped IPv4 addresses, and non-HTTP protocols
+- **Redirect validation:** HTTP redirects are not auto-followed; each redirect target is validated against the SSRF blocklist before following, with a maximum of 3 redirects
 - **Header allowlisting:** Only safe HTTP headers (`Content-Type`, `Accept`) are forwarded
 - **Method restriction:** Only `GET` and `POST` methods are proxied
+- **Rate limiting:** 30 requests per minute per IP address
 - **Authentication required:** Staff or admin token required to use the proxy
 - **Encrypted payloads only:** The proxy transports encrypted JWE blobs — the decryption key never leaves the browser, so the proxy cannot read the health data
 
@@ -364,12 +366,46 @@ All external data rendered via `innerHTML` is sanitized through an `escapeHtml()
 
 Download buttons use `data-*` attributes and event listeners instead of inline `onclick` handlers with interpolated filenames, preventing attribute injection.
 
+Additional input validation:
+- **Base64 validation (`isSafeBase64`):** Validates that base64 data contains only `[A-Za-z0-9+/=\s]` before embedding in `<embed src="data:...">` tags, preventing attribute breakout
+- **URL protocol validation (`isSafeUrl`):** Validates `https:` protocol only before rendering URLs as `href` values, preventing `javascript:` and `data:` URI injection
+- **Server-side HTML escaping:** OAuth callback error pages escape `err.message`, `orgSlug`, and `userEmail` via server-side `escapeHtml()` to prevent reflected XSS
+
 ### Browser Security
 
 - Static HTML pages served for scanner, admin, registration
 - API endpoints return JSON responses
 - Server-side FHIR validation rejects malformed data before routing
 - Browser camera access requires HTTPS (enforced by browser security model)
+
+### Rate Limiting
+
+Rate limiting protects against brute-force attacks and abuse using `express-rate-limit`:
+
+| Endpoint | Limit | Window | Purpose |
+|----------|-------|--------|---------|
+| `/api/orgs/:slug/auth` | 20 attempts | 15 minutes | Prevents password brute-force (especially important given 4-character minimum for staff passwords) |
+| `/api/orgs/:slug/shl-proxy` | 30 requests | 1 minute | Prevents proxy abuse |
+| `/api/orgs` (registration) | 5 requests | 1 hour | Prevents registration spam |
+| Super-admin endpoints | 20 attempts | 15 minutes | Protects admin API key |
+
+Rate limit headers (`RateLimit-*`) are returned in responses per RFC 6585.
+
+### OAuth CSRF Protection
+
+OAuth state parameters are HMAC-signed to prevent cross-site request forgery:
+
+1. **State generation:** `createSignedOAuthState(slug, orgId)` produces `{slug, orgId, sig}` where `sig = HMAC-SHA256(SESSION_SECRET, {slug, orgId})`
+2. **State verification:** `verifyOAuthState(state)` validates the HMAC signature using timing-safe comparison before trusting the slug or orgId
+3. **Impact:** Prevents an attacker from forging OAuth state to link their storage account to a victim's organization, which would cause PHI to be routed to the attacker's storage
+
+### Timing-Safe Comparisons
+
+All security-sensitive string comparisons use `crypto.timingSafeEqual()` to prevent timing side-channel attacks:
+
+- Session token HMAC signature verification (`src/auth.js`)
+- Super-admin API key verification (`server.js`)
+- OAuth state HMAC signature verification (`server.js`)
 
 ### Audit Logging
 
@@ -594,13 +630,14 @@ All production dependencies are well-established, actively maintained open-sourc
 |------|----------|-----------|------------|
 | **PHI exposure via server compromise** | High | Very Low | PHI decryption occurs in the browser, not on the server. The server's CORS proxy only handles encrypted JWE blobs and never possesses the decryption key. The route endpoint receives decrypted data transiently for delivery only — a server compromise would require intercepting an active routing operation. |
 | **OAuth token theft** | Medium | Very Low | Tokens encrypted at rest with per-organization AES-256-GCM keys derived from `HMAC-SHA256(SESSION_SECRET, orgId)`. A database leak alone does not expose usable tokens. Each token scoped to one organization. Revocable by admin at any time. |
-| **Session token forgery** | Medium | Low | HMAC-SHA256 signed with cryptographically random secret. Token expiration enforced server-side. |
-| **Password brute force** | Medium | Medium | bcrypt with cost factor 10 makes brute force computationally expensive (~100ms per attempt). |
+| **Session token forgery** | Medium | Very Low | HMAC-SHA256 signed with cryptographically random secret. Token expiration enforced server-side. Timing-safe comparison prevents side-channel attacks. |
+| **Password brute force** | Medium | Low | bcrypt with cost factor 10 makes brute force computationally expensive (~100ms per attempt). Rate limiting (20 attempts per 15 minutes per IP) prevents automated attacks. |
 | **QR code spoofing (app identity)** | Low | Medium | Phase 1 uses static list (spoofable). Phase 3 roadmap adds cryptographic attestation with JWS signatures. |
 | **SQL injection** | High | Very Low | All database queries use parameterized statements. Column names validated against allowlist. |
 | **Cross-tenant data access** | High | Very Low | Token-based slug verification on every request. Staff tokens cannot access other organizations' data. |
 | **Decompression bomb (zip bomb via JWE)** | Medium | Low | 5 MB maximum decompression limit enforced on all inflate operations. |
-| **SSRF via malicious SHL URL** | Medium | Low | CORS proxy validates all URLs against SSRF blocklist (RFC 1918 private ranges, localhost, link-local, non-HTTP protocols). Only HTTPS URLs to external hosts are proxied. |
+| **SSRF via malicious SHL URL** | Medium | Very Low | CORS proxy validates all URLs against SSRF blocklist (RFC 1918, RFC 4193, localhost, link-local, cloud metadata, IPv6-mapped addresses). Redirects validated before following (max 3). Rate limited to 30 requests/minute per IP. |
+| **OAuth CSRF (storage hijack)** | High | Very Low | OAuth state parameters are HMAC-signed with `SESSION_SECRET`. Callback verifies signature using timing-safe comparison before trusting the state payload. Forged state is silently rejected. |
 | **XSS via SHL content** | Medium | Very Low | All external data HTML-sanitized via `escapeHtml()` before `innerHTML` rendering. CSP restricts script sources. CDN scripts verified via SRI hashes. `connect-src 'self'` blocks data exfiltration. Poisoned QR code attack vector eliminated. |
 
 ---

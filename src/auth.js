@@ -1,4 +1,4 @@
-import { createHmac, randomBytes } from 'node:crypto';
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import bcrypt from 'bcryptjs';
 
 const COST_FACTOR = 10;
@@ -64,7 +64,10 @@ export function verifyToken(token) {
   const [payloadB64, sig] = parts;
   const expectedSig = createHmac('sha256', getSecret()).update(payloadB64).digest('base64url');
 
-  if (sig !== expectedSig) return null;
+  // Timing-safe comparison to prevent timing side-channel attacks
+  const sigBuf = Buffer.from(sig);
+  const expectedBuf = Buffer.from(expectedSig);
+  if (sigBuf.length !== expectedBuf.length || !timingSafeEqual(sigBuf, expectedBuf)) return null;
 
   try {
     const payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf-8'));
