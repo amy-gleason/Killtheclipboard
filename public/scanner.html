@@ -1132,10 +1132,13 @@
 
       scanner = new Html5Qrcode('reader');
 
+      const scanConfig = { fps: 10, qrbox: { width: 250, height: 250 } };
+
       try {
+        // Try rear camera first (phones/tablets)
         await scanner.start(
           { facingMode: 'environment' },
-          { fps: 10, qrbox: { width: 250, height: 250 } },
+          scanConfig,
           onScanSuccess,
           () => {}
         );
@@ -1143,8 +1146,21 @@
         startBtn.disabled = true;
         stopBtn.disabled = false;
         setStatus('info', 'Camera active. Point at a SMART Health Link QR code.');
-      } catch (err) {
-        setStatus('error', `Camera error: ${escapeHtml(err.message || err)}`);
+      } catch (envErr) {
+        // Fallback: use any available camera (laptops, desktops)
+        try {
+          await scanner.start(
+            { facingMode: 'user' },
+            scanConfig,
+            onScanSuccess,
+            () => {}
+          );
+          startBtn.disabled = true;
+          stopBtn.disabled = false;
+          setStatus('info', 'Camera active (front camera). Point at a SMART Health Link QR code.');
+        } catch (err) {
+          setStatus('error', `Camera error: ${escapeHtml(err.message || err)}`);
+        }
       }
     }
 
