@@ -243,7 +243,6 @@ export function updateOrgSettings(id, fields) {
     'api_url', 'api_headers',
     'email_to',
     'admin_password_hash', 'staff_password_hash',
-    'require_app_validation',
     'session_timeout_minutes',
   ];
 
